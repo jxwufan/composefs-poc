@@ -1,0 +1,83 @@
+From b143ba47212d44e3c0d49181bcb4bb4123621648 Mon Sep 17 00:00:00 2001
+From: Fan Wu <wufan@kernel.org>
+Date: Wed, 20 May 2026 21:46:55 -0700
+Subject: [RFC PATCH 3/4] erofs: expose backing-file fs-verity digest to LSMs
+ on file-backed mount
+
+composefs uses a file-backed EROFS image, sealed with fs-verity, as its
+metadata layer.
+
+Publish that backing file's fs-verity digest to LSMs on the EROFS root
+inode, so an integrity policy can authorize a file by the composefs image
+it is served from.
+
+Signed-off-by: Fan Wu <wufan@kernel.org>
+---
+ fs/erofs/super.c | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/fs/erofs/super.c b/fs/erofs/super.c
+index 802add6652fd..2ec165c271c7 100644
+--- a/fs/erofs/super.c
++++ b/fs/erofs/super.c
+@@ -12,6 +12,9 @@
+ #include <linux/exportfs.h>
+ #include <linux/backing-dev.h>
+ #include <linux/pseudo_fs.h>
++#include <linux/fsverity.h>
++#include <linux/security.h>
++#include <crypto/hash_info.h>
+ #include "xattr.h"
+ 
+ #define CREATE_TRACE_POINTS
+@@ -632,6 +635,36 @@ static void erofs_set_sysfs_name(struct super_block *sb)
+ 		super_set_sysfs_name_id(sb);
+ }
+ 
++/* Publish the backing file's fs-verity digest on the EROFS root inode. */
++static int erofs_security_set_backing_fsverity(struct super_block *sb)
++{
++	struct erofs_sb_info *sbi = EROFS_SB(sb);
++	u8 raw_digest[FS_VERITY_MAX_DIGEST_SIZE];
++	struct backing_file_fsverity_digest digest;
++	struct inode *backing;
++	enum hash_algo halg;
++	int digest_size, err;
++
++	if (!erofs_is_fileio_mode(sbi))
++		return 0;
++	backing = file_inode(sbi->dif0.file);
++
++	digest_size = fsverity_get_digest(backing, raw_digest, NULL, &halg);
++	if (digest_size == 0)
++		return 0;
++
++	digest.alg = hash_algo_name[halg];
++	digest.digest = raw_digest;
++	digest.digest_len = digest_size;
++	err = security_inode_setintegrity(d_inode(sb->s_root),
++					  LSM_INT_BACKING_FILE_FSVERITY_DIGEST,
++					  &digest, sizeof(digest));
++	if (err)
++		erofs_err(sb, "failed to publish backing fs-verity digest to LSMs: %d",
++			  err);
++	return err;
++}
++
+ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
+ {
+ 	struct inode *inode;
+@@ -776,6 +809,10 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	if (!sb->s_root)
+ 		return -ENOMEM;
+ 
++	err = erofs_security_set_backing_fsverity(sb);
++	if (err)
++		return err;
++
+ 	erofs_shrinker_register(sb);
+ 	err = erofs_xattr_prefixes_init(sb);
+ 	if (err)
+-- 
+2.54.0
+

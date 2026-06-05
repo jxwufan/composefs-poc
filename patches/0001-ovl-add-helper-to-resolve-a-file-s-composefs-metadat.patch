@@ -1,0 +1,106 @@
+From 5c403ce2483d4b9423b7c3a98ebf81edde05c88d Mon Sep 17 00:00:00 2001
+From: Fan Wu <wufan@kernel.org>
+Date: Wed, 20 May 2026 21:46:34 -0700
+Subject: [RFC PATCH 1/4] ovl: add helper to resolve a file's composefs
+ metadata dentry
+
+IPE wants to authorize a file by the fs-verity digest of the EROFS metadata
+image backing its composefs. That image records each file's data-blob fs-
+verity digest, but the blobs live in a separate store, so the image digest
+binds a file's content only when overlayfs checks each blob against its
+recorded digest, which it does only under the overlayfs verity=require
+option.
+
+d_real(@dentry, D_REAL_METADATA) already walks the (possibly nested)
+overlay stack to that EROFS metadata dentry, but it cannot tell the caller
+whether the composefs enforces verity=require.
+ovl_get_verity_composefs_metadata_dentry() does the same walk and returns
+the dentry only for a verity=require composefs.
+
+Signed-off-by: Fan Wu <wufan@kernel.org>
+---
+ MAINTAINERS               |  1 +
+ fs/overlayfs/util.c       | 31 +++++++++++++++++++++++++++++++
+ include/linux/overlayfs.h |  9 +++++++++
+ 3 files changed, 41 insertions(+)
+ create mode 100644 include/linux/overlayfs.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 9ec290e38b44..9365d20afb9d 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -20132,6 +20132,7 @@ S:	Supported
+ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/overlayfs/vfs.git
+ F:	Documentation/filesystems/overlayfs.rst
+ F:	fs/overlayfs/
++F:	include/linux/overlayfs.h
+ 
+ P54 WIRELESS DRIVER
+ M:	Christian Lamparter <chunkeey@googlemail.com>
+diff --git a/fs/overlayfs/util.c b/fs/overlayfs/util.c
+index b41f4788e4f0..36e74dc9fa49 100644
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -16,6 +16,7 @@
+ #include <linux/namei.h>
+ #include <linux/ratelimit.h>
+ #include <linux/overflow.h>
++#include <linux/overlayfs.h>
+ #include "overlayfs.h"
+ 
+ /* Get write access to upper mnt - may fail if upper sb was remounted ro */
+@@ -114,6 +115,36 @@ bool ovl_verify_lower(struct super_block *sb)
+ 	return ofs->config.nfs_export && ofs->config.index;
+ }
+ 
++/*
++ * Like d_real() with D_REAL_METADATA, resolve @dentry to the EROFS metadata
++ * dentry backing its composefs, but only when that composefs enforces
++ * verity=require.  Returns NULL otherwise.
++ */
++struct dentry *ovl_get_verity_composefs_metadata_dentry(struct dentry *dentry)
++{
++	if (!dentry || !d_is_reg(dentry))
++		return NULL;
++
++	while (dentry && dentry->d_sb->s_type == &ovl_fs_type) {
++		struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
++
++		if (ovl_dentry_upper(dentry))
++			return NULL;
++
++		/* Composefs overlay */
++		if (ofs->numdatalayer > 0) {
++			if (ofs->config.verity_mode != OVL_VERITY_REQUIRE)
++				return NULL;
++			return ovl_dentry_lower(dentry);
++		}
++
++		/* Plain overlay */
++		dentry = ovl_dentry_lower(dentry);
++	}
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(ovl_get_verity_composefs_metadata_dentry);
++
+ struct ovl_path *ovl_stack_alloc(unsigned int n)
+ {
+ 	return kzalloc_objs(struct ovl_path, n);
+diff --git a/include/linux/overlayfs.h b/include/linux/overlayfs.h
+new file mode 100644
+index 000000000000..207093cc5073
+--- /dev/null
++++ b/include/linux/overlayfs.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_OVERLAYFS_H
++#define _LINUX_OVERLAYFS_H
++
++struct dentry;
++
++struct dentry *ovl_get_verity_composefs_metadata_dentry(struct dentry *dentry);
++
++#endif /* _LINUX_OVERLAYFS_H */
+-- 
+2.54.0
+

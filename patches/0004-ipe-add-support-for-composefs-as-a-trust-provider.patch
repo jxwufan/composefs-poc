@@ -1,0 +1,527 @@
+From 4d640a7a75f13d02eedf871051be1b873f832f12 Mon Sep 17 00:00:00 2001
+From: Fan Wu <wufan@kernel.org>
+Date: Wed, 20 May 2026 21:46:55 -0700
+Subject: [RFC PATCH 4/4] ipe: add support for composefs as a trust provider
+
+Allows author of IPE policy to indicate trust for files originating from a
+specific composefs image, identified by the fs-verity digest of the backing
+EROFS metadata file, through "composefs_backing_fsverity_digest".
+
+Signed-off-by: Fan Wu <wufan@kernel.org>
+---
+ Documentation/admin-guide/LSM/ipe.rst | 35 +++++++++++++-
+ security/ipe/Kconfig                  | 12 +++++
+ security/ipe/audit.c                  | 18 +++++++
+ security/ipe/eval.c                   | 67 +++++++++++++++++++++++++++
+ security/ipe/eval.h                   | 13 +++++-
+ security/ipe/hooks.c                  | 54 +++++++++++++++++++--
+ security/ipe/hooks.h                  | 10 +++-
+ security/ipe/ipe.c                    | 17 ++++---
+ security/ipe/ipe.h                    |  9 +++-
+ security/ipe/policy.h                 |  1 +
+ security/ipe/policy_parser.c          |  2 +
+ 11 files changed, 220 insertions(+), 18 deletions(-)
+
+diff --git a/Documentation/admin-guide/LSM/ipe.rst b/Documentation/admin-guide/LSM/ipe.rst
+index a756d8158531..84050da71fb8 100644
+--- a/Documentation/admin-guide/LSM/ipe.rst
++++ b/Documentation/admin-guide/LSM/ipe.rst
+@@ -559,7 +559,8 @@ policy. Two properties are built-into the policy parser: 'op' and 'action'.
+ The other properties are used to restrict immutable security properties
+ about the files being evaluated. Currently those properties are:
+ '``boot_verified``', '``dmverity_signature``', '``dmverity_roothash``',
+-'``fsverity_signature``', '``fsverity_digest``'. A description of all
++'``fsverity_signature``', '``fsverity_digest``',
++'``composefs_backing_fsverity_digest``'. A description of all
+ properties supported by IPE are listed below:
+ 
+ op
+@@ -713,6 +714,27 @@ fsverity_signature
+ 
+       fsverity_signature=(TRUE|FALSE)
+ 
++composefs_backing_fsverity_digest
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++   This property authorizes files served by a specific composefs image,
++   identified via the fs-verity digest of the EROFS metadata file that backs
++   it. The match is per file; a file copied up to the overlay's writable upper
++   layer no longer comes from the image and will not match.
++   It depends on ``FS_VERITY``, ``EROFS_FS_BACKED_BY_FILE`` and ``OVERLAY_FS``
++   config options and is controlled by the
++   ``IPE_PROP_COMPOSEFS_BACKING_FS_VERITY`` config option, it will be
++   automatically selected when ``SECURITY_IPE``, ``FS_VERITY``,
++   ``EROFS_FS_BACKED_BY_FILE`` and ``OVERLAY_FS`` are all enabled.
++   The format of this property is::
++
++      composefs_backing_fsverity_digest=DigestName:HexadecimalString
++
++   The supported DigestNames for composefs_backing_fsverity_digest are
++
++      + sha256
++      + sha512
++
+ Policy Examples
+ ---------------
+ 
+@@ -788,6 +810,17 @@ Allow execution of a specific fs-verity file
+ 
+    op=EXECUTE fsverity_digest=sha256:fd88f2b8824e197f850bf4c5109bea5cf0ee38104f710843bb72da796ba5af9e action=ALLOW
+ 
++Allow only a specific composefs image
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++::
++
++   policy_name=Allow_Composefs_By_Digest policy_version=0.0.0
++   DEFAULT action=DENY
++
++   op=EXECUTE boot_verified=TRUE action=ALLOW
++   op=EXECUTE composefs_backing_fsverity_digest=sha256:f38fbe6a7247eb09329384259a8eda56933a44d29b197b2191b37e4cb2a8d5de action=ALLOW
++
+ Additional Information
+ ----------------------
+ 
+diff --git a/security/ipe/Kconfig b/security/ipe/Kconfig
+index a110a6cd848b..16fd578fb286 100644
+--- a/security/ipe/Kconfig
++++ b/security/ipe/Kconfig
+@@ -13,6 +13,7 @@ menuconfig SECURITY_IPE
+ 	select IPE_PROP_DM_VERITY_SIGNATURE if DM_VERITY && DM_VERITY_VERIFY_ROOTHASH_SIG
+ 	select IPE_PROP_FS_VERITY if FS_VERITY
+ 	select IPE_PROP_FS_VERITY_BUILTIN_SIG if FS_VERITY && FS_VERITY_BUILTIN_SIGNATURES
++	select IPE_PROP_COMPOSEFS_BACKING_FS_VERITY if FS_VERITY && EROFS_FS_BACKED_BY_FILE && OVERLAY_FS
+ 	help
+ 	  This option enables the Integrity Policy Enforcement LSM
+ 	  allowing users to define a policy to enforce a trust-based access
+@@ -95,6 +96,17 @@ config IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 
+ 	  if unsure, answer Y.
+ 
++config IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++	bool "Enable composefs backing-file fs-verity digest property"
++	depends on FS_VERITY && EROFS_FS_BACKED_BY_FILE && OVERLAY_FS
++	help
++	  This option enables the 'composefs_backing_fsverity_digest'
++	  property within IPE policies. The property evaluates to TRUE when
++	  a file comes from a composefs whose backing EROFS metadata image
++	  has this exact fs-verity digest, resolved per file via overlayfs.
++
++	  if unsure, answer Y.
++
+ endmenu
+ 
+ config SECURITY_IPE_KUNIT_TEST
+diff --git a/security/ipe/audit.c b/security/ipe/audit.c
+index 93fb59fbddd6..089b92de4688 100644
+--- a/security/ipe/audit.c
++++ b/security/ipe/audit.c
+@@ -62,6 +62,7 @@ static const char *const audit_prop_names[__IPE_PROP_MAX] = {
+ 	"fsverity_digest=",
+ 	"fsverity_signature=FALSE",
+ 	"fsverity_signature=TRUE",
++	"composefs_backing_fsverity_digest=",
+ };
+ 
+ /**
+@@ -86,6 +87,20 @@ static void audit_fsv_digest(struct audit_buffer *ab, const void *d)
+ 	ipe_digest_audit(ab, d);
+ }
+ 
++/**
++ * audit_composefs_backing_fsv_digest() - audit the digest of a
++ * composefs_backing_fsverity_digest property.
++ * @ab: Supplies a pointer to the audit_buffer to append to.
++ * @d: Supplies a pointer to the digest structure.
++ */
++static void audit_composefs_backing_fsv_digest(struct audit_buffer *ab,
++					       const void *d)
++{
++	audit_log_format(ab, "%s",
++			 audit_prop_names[IPE_PROP_COMPOSEFS_BACKING_FSV_DIGEST]);
++	ipe_digest_audit(ab, d);
++}
++
+ /**
+  * audit_rule() - audit an IPE policy rule.
+  * @ab: Supplies a pointer to the audit_buffer to append to.
+@@ -105,6 +120,9 @@ static void audit_rule(struct audit_buffer *ab, const struct ipe_rule *r)
+ 		case IPE_PROP_FSV_DIGEST:
+ 			audit_fsv_digest(ab, ptr->value);
+ 			break;
++		case IPE_PROP_COMPOSEFS_BACKING_FSV_DIGEST:
++			audit_composefs_backing_fsv_digest(ab, ptr->value);
++			break;
+ 		default:
+ 			audit_log_format(ab, "%s", audit_prop_names[ptr->type]);
+ 			break;
+diff --git a/security/ipe/eval.c b/security/ipe/eval.c
+index 21439c5be336..a90d3f6b136b 100644
+--- a/security/ipe/eval.c
++++ b/security/ipe/eval.c
+@@ -11,6 +11,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/moduleparam.h>
+ #include <linux/fsverity.h>
++#include <linux/overlayfs.h>
+ 
+ #include "ipe.h"
+ #include "eval.h"
+@@ -82,6 +83,37 @@ static void build_ipe_inode_ctx(struct ipe_eval_ctx *ctx, const struct inode *co
+ }
+ #endif /* CONFIG_IPE_PROP_FS_VERITY */
+ 
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++/**
++ * ipe_composefs_metadata_root() - Resolve @file to its verity-enforced
++ * composefs metadata root.
++ * @file: Supplies the file struct of the file triggered IPE event.
++ *
++ * Return: the metadata root inode, or %NULL if @file is not a verity composefs.
++ */
++static struct inode *ipe_composefs_metadata_root(const struct file *const file)
++{
++	struct dentry *md;
++
++	md = ovl_get_verity_composefs_metadata_dentry(file->f_path.dentry);
++	if (!md)
++		return NULL;
++
++	return d_inode(md->d_sb->s_root);
++}
++
++static void build_ipe_composefs_ctx(struct ipe_eval_ctx *ctx,
++				    const struct file *const file)
++{
++	ctx->composefs_metadata_root = ipe_composefs_metadata_root(file);
++}
++#else
++static inline void build_ipe_composefs_ctx(struct ipe_eval_ctx *ctx,
++					   const struct file *const file)
++{
++}
++#endif /* CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY */
++
+ /**
+  * ipe_build_eval_ctx() - Build an ipe evaluation context.
+  * @ctx: Supplies a pointer to the context to be populated.
+@@ -105,6 +137,7 @@ void ipe_build_eval_ctx(struct ipe_eval_ctx *ctx,
+ 		ino = d_real_inode(file->f_path.dentry);
+ 		build_ipe_bdev_ctx(ctx, ino);
+ 		build_ipe_inode_ctx(ctx, ino);
++		build_ipe_composefs_ctx(ctx, file);
+ 	}
+ }
+ 
+@@ -265,6 +298,38 @@ static bool evaluate_fsv_sig_true(const struct ipe_eval_ctx *const ctx)
+ }
+ #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
+ 
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++/**
++ * evaluate_composefs_backing_fsv_digest() - Evaluate @ctx against a composefs
++ * backing fsv digest property.
++ * @ctx: Supplies a pointer to the context being evaluated.
++ * @p: Supplies a pointer to the property being evaluated.
++ *
++ * Return:
++ * * %true	- The current @ctx match the @p
++ * * %false	- The current @ctx doesn't match the @p
++ */
++static bool evaluate_composefs_backing_fsv_digest(const struct ipe_eval_ctx *const ctx,
++						  struct ipe_prop *p)
++{
++	const struct ipe_inode *blob;
++
++	if (!ctx->composefs_metadata_root)
++		return false;
++
++	blob = ipe_inode(ctx->composefs_metadata_root);
++	return blob->composefs_backing_fs_verity_digest &&
++	       ipe_digest_eval(p->value,
++			       blob->composefs_backing_fs_verity_digest);
++}
++#else
++static bool evaluate_composefs_backing_fsv_digest(const struct ipe_eval_ctx *const ctx,
++						  struct ipe_prop *p)
++{
++	return false;
++}
++#endif /* CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY */
++
+ /**
+  * evaluate_property() - Analyze @ctx against a rule property.
+  * @ctx: Supplies a pointer to the context to be evaluated.
+@@ -297,6 +362,8 @@ static bool evaluate_property(const struct ipe_eval_ctx *const ctx,
+ 		return evaluate_fsv_sig_false(ctx);
+ 	case IPE_PROP_FSV_SIG_TRUE:
+ 		return evaluate_fsv_sig_true(ctx);
++	case IPE_PROP_COMPOSEFS_BACKING_FSV_DIGEST:
++		return evaluate_composefs_backing_fsv_digest(ctx, p);
+ 	default:
+ 		return false;
+ 	}
+diff --git a/security/ipe/eval.h b/security/ipe/eval.h
+index fef65a36468c..56e68fd00a0f 100644
+--- a/security/ipe/eval.h
++++ b/security/ipe/eval.h
+@@ -9,6 +9,7 @@
+ #include <linux/file.h>
+ #include <linux/types.h>
+ 
++#include "ipe.h"
+ #include "policy.h"
+ #include "hooks.h"
+ 
+@@ -31,11 +32,16 @@ struct ipe_bdev {
+ };
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ struct ipe_inode {
++#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 	bool fs_verity_signed;
++#endif
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++	struct digest_info *composefs_backing_fs_verity_digest;
++#endif
+ };
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
+ 
+ struct ipe_eval_ctx {
+ 	enum ipe_op_type op;
+@@ -52,6 +58,9 @@ struct ipe_eval_ctx {
+ #ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 	const struct ipe_inode *ipe_inode;
+ #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++	const struct inode *composefs_metadata_root;
++#endif /* CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY */
+ };
+ 
+ enum ipe_match {
+diff --git a/security/ipe/hooks.c b/security/ipe/hooks.c
+index 0ae54a880405..8a4ab95ee337 100644
+--- a/security/ipe/hooks.c
++++ b/security/ipe/hooks.c
+@@ -312,7 +312,7 @@ int ipe_bdev_setintegrity(struct block_device *bdev, enum lsm_integrity_type typ
+ }
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ /**
+  * ipe_inode_setintegrity() - save integrity data from a inode to IPE's LSM blob.
+  * @inode: The inode to source the security blob from.
+@@ -320,8 +320,9 @@ int ipe_bdev_setintegrity(struct block_device *bdev, enum lsm_integrity_type typ
+  * @value: The value to be stored.
+  * @size: The size of @value.
+  *
+- * This hook is currently used to save the existence of a validated fs-verity
+- * builtin signature into LSM blob.
++ * This hook is currently used to save a verified fs-verity built-in signature
++ * on the inode itself, or the fs-verity digest of the file backing the inode's
++ * filesystem (an EROFS file-backed mount used as composefs metadata).
+  *
+  * Return: %0 on success. If an error occurs, the function will return the
+  * -errno.
+@@ -332,11 +333,56 @@ int ipe_inode_setintegrity(const struct inode *inode,
+ {
+ 	struct ipe_inode *inode_sec = ipe_inode(inode);
+ 
++#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 	if (type == LSM_INT_FSVERITY_BUILTINSIG_VALID) {
+ 		inode_sec->fs_verity_signed = size > 0 && value;
+ 		return 0;
+ 	}
++#endif
++
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++	if (type == LSM_INT_BACKING_FILE_FSVERITY_DIGEST) {
++		const struct backing_file_fsverity_digest *digest = value;
++		struct digest_info *info;
++
++		if (!value)
++			return -EINVAL;
++
++		info = kzalloc_obj(*info);
++		if (!info)
++			return -ENOMEM;
++
++		info->digest = kmemdup(digest->digest, digest->digest_len, GFP_KERNEL);
++		info->alg = kstrdup(digest->alg, GFP_KERNEL);
++		info->digest_len = digest->digest_len;
++		if (!info->digest || !info->alg) {
++			ipe_digest_free(info);
++			return -ENOMEM;
++		}
++
++		ipe_digest_free(inode_sec->composefs_backing_fs_verity_digest);
++		inode_sec->composefs_backing_fs_verity_digest = info;
++		return 0;
++	}
++#endif
+ 
+ 	return -EINVAL;
+ }
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
++
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++/**
++ * ipe_inode_free_security() - free IPE's LSM blob allocations of an inode.
++ * @inode: Supplies a pointer to the inode being freed.
++ *
++ * The composefs backing-file fs-verity digest is held as a separately
++ * allocated digest_info; free it here. The blob memory itself is reclaimed
++ * by the LSM blob framework.
++ */
++void ipe_inode_free_security(struct inode *inode)
++{
++	struct ipe_inode *blob = ipe_inode(inode);
++
++	ipe_digest_free(blob->composefs_backing_fs_verity_digest);
++}
++#endif /* CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY */
+diff --git a/security/ipe/hooks.h b/security/ipe/hooks.h
+index 07db37332740..bb213f92f63b 100644
+--- a/security/ipe/hooks.h
++++ b/security/ipe/hooks.h
+@@ -11,6 +11,8 @@
+ #include <linux/blk_types.h>
+ #include <linux/fsverity.h>
+ 
++#include "ipe.h"
++
+ enum ipe_hook_type {
+ 	IPE_HOOK_BPRM_CHECK = 0,
+ 	IPE_HOOK_BPRM_CREDS_FOR_EXEC,
+@@ -47,9 +49,13 @@ int ipe_bdev_setintegrity(struct block_device *bdev, enum lsm_integrity_type typ
+ 			  const void *value, size_t len);
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ int ipe_inode_setintegrity(const struct inode *inode, enum lsm_integrity_type type,
+ 			   const void *value, size_t size);
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
++
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++void ipe_inode_free_security(struct inode *inode);
++#endif /* CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY */
+ 
+ #endif /* _IPE_HOOKS_H */
+diff --git a/security/ipe/ipe.c b/security/ipe/ipe.c
+index 495bb765de1b..980b9c4dba27 100644
+--- a/security/ipe/ipe.c
++++ b/security/ipe/ipe.c
+@@ -11,14 +11,14 @@
+ extern const char *const ipe_boot_policy;
+ bool ipe_enabled;
+ 
+-static struct lsm_blob_sizes ipe_blobs __ro_after_init = {
++struct lsm_blob_sizes ipe_blobs __ro_after_init = {
+ 	.lbs_superblock = sizeof(struct ipe_superblock),
+ #ifdef CONFIG_IPE_PROP_DM_VERITY
+ 	.lbs_bdev = sizeof(struct ipe_bdev),
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ 	.lbs_inode = sizeof(struct ipe_inode),
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
+ };
+ 
+ static const struct lsm_id ipe_lsmid = {
+@@ -38,12 +38,12 @@ struct ipe_bdev *ipe_bdev(struct block_device *b)
+ }
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ struct ipe_inode *ipe_inode(const struct inode *inode)
+ {
+ 	return inode->i_security + ipe_blobs.lbs_inode;
+ }
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
+ 
+ static struct security_hook_list ipe_hooks[] __ro_after_init = {
+ 	LSM_HOOK_INIT(bprm_check_security, ipe_bprm_check_security),
+@@ -57,9 +57,12 @@ static struct security_hook_list ipe_hooks[] __ro_after_init = {
+ 	LSM_HOOK_INIT(bdev_free_security, ipe_bdev_free_security),
+ 	LSM_HOOK_INIT(bdev_setintegrity, ipe_bdev_setintegrity),
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ 	LSM_HOOK_INIT(inode_setintegrity, ipe_inode_setintegrity),
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
++#ifdef CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY
++	LSM_HOOK_INIT(inode_free_security, ipe_inode_free_security),
++#endif /* CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY */
+ };
+ 
+ /**
+diff --git a/security/ipe/ipe.h b/security/ipe/ipe.h
+index 25cfdb8f0c20..aebc5e7e51c9 100644
+--- a/security/ipe/ipe.h
++++ b/security/ipe/ipe.h
+@@ -16,12 +16,17 @@ struct ipe_superblock *ipe_sb(const struct super_block *sb);
+ 
+ extern bool ipe_enabled;
+ 
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++	defined(CONFIG_IPE_PROP_COMPOSEFS_BACKING_FS_VERITY)
++#define IPE_HAS_INODE_BLOB
++#endif
++
+ #ifdef CONFIG_IPE_PROP_DM_VERITY
+ struct ipe_bdev *ipe_bdev(struct block_device *b);
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#ifdef IPE_HAS_INODE_BLOB
+ struct ipe_inode *ipe_inode(const struct inode *inode);
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* IPE_HAS_INODE_BLOB */
+ 
+ int ipe_init_securityfs(void);
+ 
+diff --git a/security/ipe/policy.h b/security/ipe/policy.h
+index 5bfbdbddeef8..8d8b5ec05c78 100644
+--- a/security/ipe/policy.h
++++ b/security/ipe/policy.h
+@@ -39,6 +39,7 @@ enum ipe_prop_type {
+ 	IPE_PROP_FSV_DIGEST,
+ 	IPE_PROP_FSV_SIG_FALSE,
+ 	IPE_PROP_FSV_SIG_TRUE,
++	IPE_PROP_COMPOSEFS_BACKING_FSV_DIGEST,
+ 	__IPE_PROP_MAX
+ };
+ 
+diff --git a/security/ipe/policy_parser.c b/security/ipe/policy_parser.c
+index 6fa5bebf8471..96f4328ea177 100644
+--- a/security/ipe/policy_parser.c
++++ b/security/ipe/policy_parser.c
+@@ -281,6 +281,7 @@ static const match_table_t property_tokens = {
+ 	{IPE_PROP_FSV_DIGEST,		"fsverity_digest=%s"},
+ 	{IPE_PROP_FSV_SIG_FALSE,	"fsverity_signature=FALSE"},
+ 	{IPE_PROP_FSV_SIG_TRUE,		"fsverity_signature=TRUE"},
++	{IPE_PROP_COMPOSEFS_BACKING_FSV_DIGEST,	"composefs_backing_fsverity_digest=%s"},
+ 	{IPE_PROP_INVALID,		NULL}
+ };
+ 
+@@ -314,6 +315,7 @@ static int parse_property(char *t, struct ipe_rule *r)
+ 	switch (token) {
+ 	case IPE_PROP_DMV_ROOTHASH:
+ 	case IPE_PROP_FSV_DIGEST:
++	case IPE_PROP_COMPOSEFS_BACKING_FSV_DIGEST:
+ 		dup = match_strdup(&args[0]);
+ 		if (!dup) {
+ 			rc = -ENOMEM;
+-- 
+2.54.0
+

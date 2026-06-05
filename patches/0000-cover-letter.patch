@@ -1,0 +1,57 @@
+From 4d640a7a75f13d02eedf871051be1b873f832f12 Mon Sep 17 00:00:00 2001
+From: Fan Wu <wufan@kernel.org>
+Date: Fri, 5 Jun 2026 19:55:13 -0700
+Subject: [RFC PATCH 0/4] IPE support for authorizing a trusted composefs image
+
+This series lets IPE authorize files that come from a specific, trusted
+composefs image, identified by the fs-verity digest of its backing EROFS
+metadata file.
+
+A composefs is an overlayfs over a file-backed EROFS metadata image. That
+image records each file's data-blob fs-verity digest, but the blobs live in
+a separate store, so the image's own fs-verity digest binds a file's
+content only when overlayfs checks each blob against its recorded digest,
+which it does only under the overlayfs verity=require option.
+
+d_real(dentry, D_REAL_METADATA) already walks the (possibly nested) overlay
+stack to that EROFS metadata dentry, but it cannot tell the caller whether
+the composefs enforces verity=require. So patch 1 adds a helper that does
+the same walk and hands back the dentry only for a verity=require
+composefs. This duplicates d_real() and adds a new public overlayfs
+interface; I found no cleaner way, and better ideas are welcome.
+
+The rest follows: at mount time erofs publishes the backing file's
+fs-verity digest on the EROFS metadata root inode via
+security_inode_setintegrity(); IPE takes the dentry from patch 1, reads the
+digest off that root inode's security blob, and matches it against the
+policy.
+
+Fan Wu (4):
+  ovl: add helper to resolve a file's composefs metadata dentry
+  lsm: add LSM_INT_BACKING_FILE_FSVERITY_DIGEST integrity type
+  erofs: expose backing-file fs-verity digest to LSMs on file-backed
+    mount
+  ipe: add support for composefs as a trust provider
+
+ Documentation/admin-guide/LSM/ipe.rst | 35 +++++++++++++-
+ MAINTAINERS                           |  1 +
+ fs/erofs/super.c                      | 37 +++++++++++++++
+ fs/overlayfs/util.c                   | 31 +++++++++++++
+ include/linux/overlayfs.h             |  9 ++++
+ include/linux/security.h              |  7 +++
+ security/ipe/Kconfig                  | 12 +++++
+ security/ipe/audit.c                  | 18 +++++++
+ security/ipe/eval.c                   | 67 +++++++++++++++++++++++++++
+ security/ipe/eval.h                   | 13 +++++-
+ security/ipe/hooks.c                  | 54 +++++++++++++++++++--
+ security/ipe/hooks.h                  | 10 +++-
+ security/ipe/ipe.c                    | 17 ++++---
+ security/ipe/ipe.h                    |  9 +++-
+ security/ipe/policy.h                 |  1 +
+ security/ipe/policy_parser.c          |  2 +
+ 16 files changed, 305 insertions(+), 18 deletions(-)
+ create mode 100644 include/linux/overlayfs.h
+
+-- 
+2.54.0
+

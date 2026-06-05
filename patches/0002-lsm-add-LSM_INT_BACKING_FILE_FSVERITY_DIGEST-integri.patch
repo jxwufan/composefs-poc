@@ -1,0 +1,42 @@
+From 7a6d6d501d73210be1720914994d085bf925f5e8 Mon Sep 17 00:00:00 2001
+From: Fan Wu <wufan@kernel.org>
+Date: Wed, 20 May 2026 21:46:34 -0700
+Subject: [RFC PATCH 2/4] lsm: add LSM_INT_BACKING_FILE_FSVERITY_DIGEST
+ integrity type
+
+Add an lsm_integrity_type value, LSM_INT_BACKING_FILE_FSVERITY_DIGEST, for
+EROFS to publish on a file-backed mount's root inode the fs-verity digest
+of the file backing that mount. An LSM such as IPE reads it back from the
+root inode's security blob to authorize files from a specific composefs
+image.
+
+Signed-off-by: Fan Wu <wufan@kernel.org>
+---
+ include/linux/security.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 41d7367cf403..3f10bf4c6308 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -94,10 +94,17 @@ struct dm_verity_digest {
+ 	size_t digest_len;
+ };
+ 
++struct backing_file_fsverity_digest {
++	const char *alg;
++	const u8 *digest;
++	size_t digest_len;
++};
++
+ enum lsm_integrity_type {
+ 	LSM_INT_DMVERITY_SIG_VALID,
+ 	LSM_INT_DMVERITY_ROOTHASH,
+ 	LSM_INT_FSVERITY_BUILTINSIG_VALID,
++	LSM_INT_BACKING_FILE_FSVERITY_DIGEST,
+ };
+ 
+ /*
+-- 
+2.54.0
+
